@@ -1,6 +1,18 @@
 package app.shaz.stuffreader;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
+import android.net.wifi.WifiManager;
+import android.view.KeyEvent;
+import org.json.JSONObject;
+import java.io.File;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -61,6 +73,26 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     private Button playBtn;
     private CheckBox repeatBox;
     private LinearLayout voiceBox;
+    private Button castBtn;
+
+    // ---- casting ----
+    private static class CastDevice { String name, host; int port; }
+    private final LinkedHashMap<String, CastDevice> devices = new LinkedHashMap<>();
+    private final List<NsdServiceInfo> resolveQueue = new ArrayList<>();
+    private boolean resolving = false;
+    private NsdManager nsd;
+    private NsdManager.DiscoveryListener discovery;
+    private WifiManager.MulticastLock mcLock;
+    private CastClient cast;
+    private FileServer server;
+    private int serverPort = -1;
+    private File castDir;
+    private final Map<Integer, File> synthDone = new HashMap<>();
+    private final Set<Integer> synthPending = new HashSet<>();
+    private int synthGen = 0, fileSeq = 0;
+    private int pendingLoad = -1;   // line waiting for its audio before being sent to the device
+    private int awaitingIdx = -1;   // line currently playing on the device
+    private boolean sawPlaying = false;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -71,9 +103,14 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         tts = new TextToSpeech(this, this);
         tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
             @Override public void onStart(String id) { }
-            @Override public void onDone(final String id) { runOnUiThread(new Runnable() { public void run() { advance(id); } }); }
-            @Override public void onError(final String id) { runOnUiThread(new Runnable() { public void run() { advance(id); } }); }
+            @Override public void onDone(final String id) { runOnUiThread(new Runnable() { public void run() { utteranceDone(id, true); } }); }
+            @Override public void onError(final String id) { runOnUiThread(new Runnable() { public void run() { utteranceDone(id, false); } }); }
         });
+
+        castDir = new File(getCacheDir(), "cast");
+        castDir.mkdirs();
+        for (File f : castDir.listFiles()) f.delete();
+        startDiscovery();
 
         if (!handleIncoming(getIntent())) {
             String saved = prefs.getString("uri", null);
@@ -120,6 +157,11 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         open.setText("Open stuff.txt");
         open.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { pickFile(); } });
         root.addView(open);
+
+        castBtn = new Button(this);
+        castBtn.setText("Playing on: this phone");
+        castBtn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { showCastPicker(); } });
+        root.addView(castBtn);
 
         fileLabel = new TextView(this);
         fileLabel.setText("No file loaded");
@@ -239,6 +281,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             if (t.length() > 0) lines.add(t);
         }
         fileName = name;
+        clearSynth();
         idx = 0;
         saveIdx();
         fileLabel.setText((name == null ? "File" : name) + " — " + lines.size() + " lines");
@@ -333,6 +376,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             cb.setChecked(chosen.contains(v.getName()));
             cb.setOnClickListener(new View.OnClickListener() { public void onClick(View view) {
                 if (cb.isChecked()) chosen.add(v.getName()); else chosen.remove(v.getName());
+                clearSynth();
                 prefs.edit().putStringSet("voices", new HashSet<>(chosen)).apply(); } });
             cb.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View view) {
                 boolean was = playing; stop();
@@ -355,6 +399,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         if (!ttsReady) { toast("Speech engine still starting…"); return; }
         if (lines.isEmpty()) { toast("Open stuff.txt first"); return; }
         if (activeVoices().isEmpty()) { toast("Tick at least one voice"); return; }
+        if (cast != null && !cast.isReady()) { toast("Still connecting to " + cast.name + "…"); return; }
         if (idx >= lines.size()) idx = 0;
         playing = true;
         playBtn.setText("■ Stop");
@@ -365,6 +410,10 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     private void stop() {
         playing = false;
         if (tts != null) tts.stop();
+        synthPending.clear();
+        pendingLoad = -1;
+        if (cast != null && awaitingIdx >= 0) cast.stopMedia();
+        awaitingIdx = -1;
         if (playBtn != null) playBtn.setText("▶ Play");
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
@@ -390,18 +439,25 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         infoView.setText("Line " + (Math.min(idx, lines.size() - 1) + 1) + " of " + lines.size() + vs);
     }
 
+    private void applyVoice(int i) {
+        Voice v = voiceFor(i);
+        if (v != null) tts.setVoice(v);
+        tts.setPitch(noFemaleDetected ? 1.2f + 0.05f * (i % 3) : 1.0f);
+    }
+
     private void speakCurrent() {
         showLine();
-        Voice v = voiceFor(idx);
-        if (v != null) tts.setVoice(v);
-        float pitch = 1.0f;
-        if (noFemaleDetected) pitch = 1.2f + 0.05f * (idx % 3);
-        tts.setPitch(pitch);
+        if (cast != null) { castCurrent(); return; }
+        applyVoice(idx);
         tts.speak(lines.get(idx), TextToSpeech.QUEUE_FLUSH, null, "L" + idx);
     }
 
-    private void advance(String id) {
-        if (!playing || !("L" + idx).equals(id)) return;
+    private void utteranceDone(String id, boolean ok) {
+        if (id.startsWith("S")) { synthFinished(id, ok); return; }
+        if (playing && cast == null && ("L" + idx).equals(id)) nextLine();
+    }
+
+    private void nextLine() {
         idx++;
         if (idx >= lines.size()) {
             if (repeat) idx = 0;
@@ -411,8 +467,187 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         speakCurrent();
     }
 
+    // ---------- Casting ----------
+
+    private void startDiscovery() {
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            mcLock = wm.createMulticastLock("stuffreader");
+            mcLock.setReferenceCounted(false);
+            mcLock.acquire();
+        } catch (Exception ignored) { }
+        nsd = (NsdManager) getSystemService(Context.NSD_SERVICE);
+        discovery = new NsdManager.DiscoveryListener() {
+            public void onStartDiscoveryFailed(String t, int e) { }
+            public void onStopDiscoveryFailed(String t, int e) { }
+            public void onDiscoveryStarted(String t) { }
+            public void onDiscoveryStopped(String t) { }
+            public void onServiceFound(final NsdServiceInfo si) {
+                handler.post(new Runnable() { public void run() { resolveQueue.add(si); resolveNext(); } });
+            }
+            public void onServiceLost(final NsdServiceInfo si) {
+                handler.post(new Runnable() { public void run() { devices.remove(si.getServiceName()); } });
+            }
+        };
+        try { nsd.discoverServices("_googlecast._tcp", NsdManager.PROTOCOL_DNS_SD, discovery); }
+        catch (Exception e) { discovery = null; }
+    }
+
+    private void resolveNext() {
+        if (resolving || resolveQueue.isEmpty()) return;
+        resolving = true;
+        NsdServiceInfo si = resolveQueue.remove(0);
+        try {
+            nsd.resolveService(si, new NsdManager.ResolveListener() {
+                public void onResolveFailed(NsdServiceInfo s, int e) {
+                    handler.post(new Runnable() { public void run() { resolving = false; resolveNext(); } });
+                }
+                public void onServiceResolved(final NsdServiceInfo s) {
+                    handler.post(new Runnable() { public void run() {
+                        resolving = false;
+                        if (s.getHost() != null) {
+                            CastDevice d = new CastDevice();
+                            d.host = s.getHost().getHostAddress();
+                            d.port = s.getPort();
+                            d.name = s.getServiceName();
+                            try {
+                                byte[] fn = s.getAttributes().get("fn");
+                                if (fn != null) d.name = new String(fn, "UTF-8");
+                            } catch (Exception ignored) { }
+                            devices.put(s.getServiceName(), d);
+                        }
+                        resolveNext();
+                    }});
+                }
+            });
+        } catch (Exception e) { resolving = false; }
+    }
+
+    private void showCastPicker() {
+        final List<CastDevice> list = new ArrayList<>(devices.values());
+        String[] items = new String[list.size() + 1];
+        items[0] = (cast == null ? "✓ " : "") + "This phone";
+        for (int i = 0; i < list.size(); i++)
+            items[i + 1] = (cast != null && cast.name.equals(list.get(i).name) ? "✓ " : "") + list.get(i).name;
+        AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle("Play on…");
+        if (list.isEmpty()) b.setMessage("No Cast devices found yet. Make sure your phone is on the same Wi-Fi as your Chromecast or speaker, then try again in a few seconds.")
+                .setPositiveButton("This phone", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) { useDevice(null); } })
+                .setNegativeButton("Close", null);
+        else b.setItems(items, new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+                useDevice(w == 0 ? null : list.get(w - 1)); } });
+        b.show();
+    }
+
+    private void useDevice(CastDevice d) {
+        boolean wasPlaying = playing;
+        stop();
+        if (cast != null) { cast.shutdown(); cast = null; }
+        if (d == null) { castBtn.setText("Playing on: this phone"); if (wasPlaying) play(); return; }
+        if (FileServer.localIp() == null) { toast("Connect your phone to Wi-Fi to cast"); castBtn.setText("Playing on: this phone"); return; }
+        try {
+            if (server == null) server = new FileServer(castDir);
+            serverPort = server.start();
+        } catch (Exception e) { toast("Couldn't start casting: " + e.getMessage()); return; }
+        castBtn.setText("Connecting to " + d.name + "…");
+        final boolean resume = wasPlaying;
+        final CastClient[] me = new CastClient[1];
+        me[0] = new CastClient(d.name, d.host, d.port, new CastClient.Listener() {
+            public void onReady() {
+                if (cast != me[0]) return;
+                castBtn.setText("Playing on: " + cast.name + "  (volume keys work)");
+                if (resume) play();
+            }
+            public void onMediaStatus(JSONObject s) { if (cast == me[0]) mediaStatus(s); }
+            public void onClosed(String reason) {
+                if (cast != me[0]) return;
+                stop();
+                cast = null;
+                castBtn.setText("Playing on: this phone");
+                toast(reason);
+            }
+        });
+        cast = me[0];
+        cast.connect();
+    }
+
+    private void clearSynth() {
+        synthGen++;
+        synthDone.clear();
+        synthPending.clear();
+        pendingLoad = -1;
+    }
+
+    private void ensureSynth(int i) {
+        if (i < 0 || i >= lines.size() || synthDone.containsKey(i) || synthPending.contains(i)) return;
+        synthPending.add(i);
+        File f = new File(castDir, "u" + (++fileSeq) + ".wav");
+        applyVoice(i);
+        tts.synthesizeToFile(lines.get(i), new Bundle(), f, "S" + synthGen + "_" + i + "_" + fileSeq);
+    }
+
+    private void synthFinished(String id, boolean ok) {
+        String[] p = id.substring(1).split("_");
+        if (Integer.parseInt(p[0]) != synthGen) return;
+        int i = Integer.parseInt(p[1]);
+        if (!synthPending.remove(i)) return;
+        File f = new File(castDir, "u" + p[2] + ".wav");
+        if (!ok || !f.isFile()) {
+            if (playing && pendingLoad == i) { pendingLoad = -1; nextLine(); }
+            return;
+        }
+        synthDone.put(i, f);
+        if (playing && pendingLoad == i) { pendingLoad = -1; castLoad(i); }
+    }
+
+    private void castCurrent() {
+        awaitingIdx = -1;
+        if (synthDone.containsKey(idx)) castLoad(idx);
+        else { pendingLoad = idx; ensureSynth(idx); }
+    }
+
+    private void castLoad(int i) {
+        String ip = FileServer.localIp();
+        if (ip == null || cast == null) { stop(); toast("Lost Wi-Fi"); return; }
+        awaitingIdx = i;
+        sawPlaying = false;
+        cast.load("http://" + ip + ":" + serverPort + "/" + synthDone.get(i).getName(), lines.get(i));
+        int n = i + 1 < lines.size() ? i + 1 : (repeat ? 0 : -1);
+        ensureSynth(n);   // get the next line ready while this one plays
+        // drop audio files we no longer need
+        for (Integer k : new ArrayList<>(synthDone.keySet()))
+            if (k != i && k != n) { synthDone.get(k).delete(); synthDone.remove(k); }
+    }
+
+    private void mediaStatus(JSONObject s) {
+        if (!playing || awaitingIdx != idx) return;
+        String state = s.optString("playerState");
+        if ("PLAYING".equals(state) || "BUFFERING".equals(state)) { sawPlaying = true; return; }
+        if (!"IDLE".equals(state)) return;
+        String why = s.optString("idleReason");
+        if ("ERROR".equals(why) || ("FINISHED".equals(why) && sawPlaying)) { awaitingIdx = -1; nextLine(); }
+        else if ("CANCELLED".equals(why) && sawPlaying) { awaitingIdx = -1; stop(); }   // stopped from the device / Google Home
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        int k = e.getKeyCode();
+        if (cast != null && cast.isReady() && (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN) {
+                double v = cast.getVolume() < 0 ? 0.5 : cast.getVolume();
+                cast.setVolume(v + (k == KeyEvent.KEYCODE_VOLUME_UP ? 0.05 : -0.05));
+                toast("Volume " + Math.round(cast.getVolume() * 100) + "%");
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(e);
+    }
+
     @Override
     protected void onDestroy() {
+        if (cast != null) cast.shutdown();
+        if (server != null) server.stop();
+        try { if (discovery != null) nsd.stopServiceDiscovery(discovery); } catch (Exception ignored) { }
+        try { if (mcLock != null) mcLock.release(); } catch (Exception ignored) { }
         if (tts != null) { tts.stop(); tts.shutdown(); }
         super.onDestroy();
     }

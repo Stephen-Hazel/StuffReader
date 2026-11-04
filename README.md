@@ -6,6 +6,10 @@ Android app that reads a text file (e.g. `stuff.txt`) aloud, line after line, ro
 - Remembers the file and position; Play/Stop, previous/next, restart, repeat
 - Voice list: female voices pre-ticked (detected from Google/Samsung voice names); long-press to preview
 - If no voice can be identified as female, all voices are used with a raised pitch
+- Cast to a Chromecast, Google/Nest speaker or Cast-enabled TV on the same Wi-Fi: each line is
+  synthesized to a WAV, served from a tiny HTTP server on the phone, and played on the
+  Default Media Receiver. Volume keys control the cast device. (Cast protocol implemented
+  directly in `CastClient.java`; no Play Services dependency.)
 
 ## Build
 
