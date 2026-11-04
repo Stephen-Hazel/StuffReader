@@ -154,7 +154,7 @@ public class CastClient {
         sendAsync(new Job() { public void run() throws Exception {
             JSONObject meta = new JSONObject().put("metadataType", 0).put("title", title);
             JSONObject media = new JSONObject().put("contentId", url).put("streamType", "BUFFERED")
-                .put("contentType", "audio/wav").put("metadata", meta);
+                .put("contentType", url.endsWith(".mp3") ? "audio/mpeg" : "audio/wav").put("metadata", meta);
             send(transportId, NS_MEDIA, new JSONObject().put("type", "LOAD").put("requestId", nextId())
                 .put("media", media).put("autoplay", true));
         }});

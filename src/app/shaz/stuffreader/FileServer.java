@@ -78,7 +78,7 @@ public class FileServer {
             long count = Math.max(0, end - start + 1);
             StringBuilder h = new StringBuilder();
             h.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
-            h.append("Content-Type: audio/wav\r\n");
+            h.append("Content-Type: ").append(name.endsWith(".mp3") ? "audio/mpeg" : "audio/wav").append("\r\n");
             h.append("Content-Length: ").append(count).append("\r\n");
             h.append("Accept-Ranges: bytes\r\n");
             if (partial) h.append("Content-Range: bytes ").append(start).append('-').append(end).append('/').append(len).append("\r\n");

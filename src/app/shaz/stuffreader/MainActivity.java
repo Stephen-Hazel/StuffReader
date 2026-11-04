@@ -12,6 +12,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
@@ -22,6 +23,7 @@ import android.os.Handler;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.Voice;
+import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -29,16 +31,23 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -50,6 +59,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
@@ -74,21 +85,32 @@ public class MainActivity extends Activity {
     private static final int SUBTEXT   = Color.rgb(138, 106, 122);
     private static final int LINE      = Color.rgb(243, 217, 227);
 
-    // ---- speech engines & voices ----
-    private static class Eng { String pkg, label; TextToSpeech tts; boolean ready; final List<Voice> voices = new ArrayList<>(); }
-    private static class VItem { Eng e; Voice v; String key; }
-    private final List<Eng> engines = new ArrayList<>();
+    // ---- voice sources ----
+    private static final int SYS = 0, PIPER = 1, CLOUD = 2;
+    private static class Eng {
+        int kind; String pkg, label; TextToSpeech tts; boolean ready;
+        final List<Voice> voices = new ArrayList<>();                    // SYS
+        final List<Cloud.CVoice> cloudVoices = new ArrayList<>();        // CLOUD
+    }
+    private static class VItem { Eng e; Voice v; String id, name, key; }
+    private final List<Eng> engines = new ArrayList<>();   // installed system engines, default first
+    private Eng piperEng;
+    private final Map<String, Eng> cloudEngs = new LinkedHashMap<>();
     private final List<VItem> voices = new ArrayList<>();   // voices shown in the list
     private final Set<String> chosen = new HashSet<>();      // keys of ticked voices
     private boolean noFemaleDetected = false;
     private boolean ttsReady = false;
     private int uttSeq = 0;
     private String curUtt = null;
+    private Piper piper;
+    private final Map<String, Integer> downloads = new HashMap<>();   // piper id -> percent
+    private Runnable refreshPiperDialog = null;
+    private final ExecutorService bg = Executors.newSingleThreadExecutor();
 
     // ---- lines & order ----
     private final List<String> lines = new ArrayList<>();
     private List<Integer> order = new ArrayList<>();   // position -> line index
-    private List<Integer> upcoming = null;              // next round's shuffle, made early so casting can prefetch
+    private List<Integer> upcoming = null;              // next round's shuffle, made early so the next line can be prepared
     private final Random rnd = new Random();
     private int idx = 0;                                 // position within order
     private boolean playing = false;
@@ -99,6 +121,17 @@ public class MainActivity extends Activity {
 
     private TextView fileLabel, lineView, infoView, noticeView, playBtn, castBtn;
     private LinearLayout voiceBox;
+
+    // ---- audio-file playback (Piper, cloud voices, and casting) ----
+    private MediaPlayer player;
+    private File castDir, cloudCache;
+    private final Map<Integer, File> synthDone = new HashMap<>();   // keyed by line index
+    private final Set<Integer> synthPending = new HashSet<>();
+    private final Map<String, File> synthFiles = new HashMap<>();   // utterance id -> output file
+    private int synthGen = 0, fileSeq = 0, failures = 0;
+    private String lastError = null;
+    private int pendingLoad = -1;   // line waiting for its audio
+    private int awaitingIdx = -1;   // line whose audio is playing
 
     // ---- casting ----
     private static class CastDevice { String name, host; int port; }
@@ -111,12 +144,6 @@ public class MainActivity extends Activity {
     private CastClient cast;
     private FileServer server;
     private int serverPort = -1;
-    private File castDir;
-    private final Map<Integer, File> synthDone = new HashMap<>();   // keyed by line index
-    private final Set<Integer> synthPending = new HashSet<>();
-    private int synthGen = 0, fileSeq = 0;
-    private int pendingLoad = -1;   // line waiting for its audio before being sent to the device
-    private int awaitingIdx = -1;   // line currently playing on the device
     private boolean sawPlaying = false;
 
     private final UtteranceProgressListener progress = new UtteranceProgressListener() {
@@ -130,18 +157,33 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         prefs = getSharedPreferences("stuff", MODE_PRIVATE);
         randomize = prefs.getBoolean("randomize", true);
-        buildUi();
-        addEngine(null, null);   // default engine; the others are added once it's up
-
+        piper = new Piper(getFilesDir());
         castDir = new File(getCacheDir(), "cast");
         castDir.mkdirs();
         for (File f : castDir.listFiles()) f.delete();
+        cloudCache = new File(getFilesDir(), "cloudcache");
+        cloudCache.mkdirs();
+
+        buildUi();
+
+        piperEng = new Eng();
+        piperEng.kind = PIPER; piperEng.pkg = "piper"; piperEng.label = "Piper"; piperEng.ready = true;
+        for (String p : Cloud.PROVIDERS) if (prefs.getString("key_" + p, null) != null) loadCloudEng(p);
+        addEngine(null, null);   // default system engine; the others are added once it's up
+        rebuildVoices();
+
         startDiscovery();
 
         if (!handleIncoming(getIntent())) {
             String saved = prefs.getString("uri", null);
             if (saved != null) loadFile(Uri.parse(saved), false);
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        scanEngines();   // pick up speech engines installed while we were away
     }
 
     @Override
@@ -202,6 +244,15 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    /** Small pill used inside rows. */
+    private TextView chip(String text, boolean primary) {
+        TextView t = pill(text, primary);
+        t.setTextSize(13);
+        t.setPadding(dp(12), dp(6), dp(12), dp(6));
+        t.setElevation(0);
+        return t;
+    }
+
     /** Circular icon button. */
     private TextView roundBtn(String glyph, int sizeDp, boolean primary) {
         TextView t = new TextView(this);
@@ -254,15 +305,15 @@ public class MainActivity extends Activity {
         return cb;
     }
 
-    /** A tappable rounded row: checkbox, title + subtitle, optional trailing view. */
-    private LinearLayout checkRow(final CheckBox cb, String title, String sub, View trailing) {
+    /** A tappable rounded row: optional leading view, title + subtitle, optional trailing view. */
+    private LinearLayout row(View leading, String title, String sub, View trailing) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(6), dp(8), dp(6));
+        row.setPadding(dp(leading == null ? 14 : 6), dp(8), dp(8), dp(8));
         row.setClickable(true);
         row.setFocusable(true);
-        row.addView(cb);
+        if (leading != null) row.addView(leading);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(4), 0, dp(4), 0);
@@ -273,13 +324,28 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.setMargins(0, dp(6), 0, 0);
         row.setLayoutParams(lp);
-        styleRow(row, cb.isChecked());
+        styleRow(row, false);
         return row;
     }
 
     private void styleRow(View row, boolean on) {
         row.setBackground(ripple(shape(on ? TINT_ROW : CARD, 14, on ? ROSE_MID : LINE), ROSE_SOFT));
     }
+
+    /** A dialog whose body is a scrolling list of rows. */
+    private LinearLayout dialogBody(String intro) {
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(20), dp(8), dp(20), dp(8));
+        if (intro != null) {
+            TextView t = text(intro, 14, SUBTEXT, false);
+            t.setPadding(0, 0, 0, dp(6));
+            body.addView(t);
+        }
+        return body;
+    }
+
+    private ScrollView scrollOf(View v) { ScrollView s = new ScrollView(this); s.addView(v); return s; }
 
     // ---------- UI ----------
 
@@ -368,18 +434,18 @@ public class MainActivity extends Activity {
         LinearLayout opts = card();
         final CheckBox rb = checkBox();
         rb.setChecked(randomize);
-        final LinearLayout rrow = checkRow(rb, "Randomize lines", "A fresh shuffle each time the app opens, and every round", null);
+        final LinearLayout rrow = row(rb, "Randomize lines", "A fresh shuffle each time the app opens, and every round", null);
+        styleRow(rrow, randomize);
         rrow.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
             rb.setChecked(!rb.isChecked()); styleRow(rrow, rb.isChecked()); setRandomize(rb.isChecked()); } });
-        LinearLayout.LayoutParams rlp = (LinearLayout.LayoutParams) rrow.getLayoutParams();
-        rlp.setMargins(0, 0, 0, 0);
+        ((LinearLayout.LayoutParams) rrow.getLayoutParams()).setMargins(0, 0, 0, 0);
         opts.addView(rrow);
         root.addView(opts);
 
         // voices
         LinearLayout vc = card();
         vc.addView(text("Voices", 18, TEXT, true));
-        TextView vh = text("Each line uses the next ticked voice. Tap ▶ to hear one.", 13, SUBTEXT, false);
+        TextView vh = text("Each line uses the next ticked voice. Tap ▶ to hear one, tap a heading to fold it.", 13, SUBTEXT, false);
         vh.setPadding(0, dp(2), 0, dp(4));
         vc.addView(vh);
         voiceBox = new LinearLayout(this);
@@ -402,18 +468,208 @@ public class MainActivity extends Activity {
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
 
+    // ---------- "Get more voices" ----------
+
     private void moreVoices() {
-        new AlertDialog.Builder(this).setTitle("More voices")
-            .setMessage("Stuff Reader uses every speech engine installed on your phone.\n\n"
-                + "• Speech Services by Google: in its settings, tap Install voice data → English and download "
-                + "the other accents (UK, Australia, India…). Each one adds several voices.\n\n"
-                + "• Install another engine from the Play Store, e.g. Samsung TTS, RHVoice, or Acapela. "
-                + "Their voices show up here automatically next time you open the app.")
+        String[] items = {
+            "🎙  Piper voices — free, offline, natural-sounding",
+            "☁  Cloud voices — Google, OpenAI, ElevenLabs (your API key)",
+            "🧩  Free speech engines — SherpaTTS, RHVoice, eSpeak",
+            "⚙  Phone speech settings — more Google accents",
+        };
+        new AlertDialog.Builder(this).setTitle("Get more voices")
+            .setItems(items, new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+                if (w == 0) piperDialog();
+                else if (w == 1) cloudDialog();
+                else if (w == 2) enginesDialog();
+                else googleVoiceData();
+            } })
+            .setNegativeButton("Close", null)
+            .show();
+    }
+
+    private void googleVoiceData() {
+        new AlertDialog.Builder(this).setTitle("More Google voices")
+            .setMessage("In the next screen tap the ⚙ next to Speech Services by Google → Install voice data → English, and download the other accents (UK, Australia, India…). Each adds several voices.")
             .setPositiveButton("Open speech settings", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
                 try { startActivity(new Intent("com.android.settings.TTS_SETTINGS")); }
                 catch (Exception e) { toast("Open Settings → Accessibility → Text-to-speech"); } } })
             .setNegativeButton("Close", null)
             .show();
+    }
+
+    private void piperDialog() {
+        if (!Piper.available()) {
+            new AlertDialog.Builder(this).setTitle("Piper voices")
+                .setMessage("Piper voices need a 64-bit phone, and this one can't run them.\n\n(" + Piper.unavailableReason() + ")")
+                .setPositiveButton("OK", null).show();
+            return;
+        }
+        final LinearLayout body = dialogBody("Natural-sounding voices that run on your phone, no internet needed once downloaded. About 20–30 MB each.");
+        refreshPiperDialog = new Runnable() { public void run() {
+            while (body.getChildCount() > 1) body.removeViewAt(1);
+            for (final Piper.Model m : Piper.CATALOG) {
+                final boolean have = piper.installed(m.id);
+                Integer pc = downloads.get(m.id);
+                TextView btn = chip(pc != null ? pc + "%" : have ? "Remove" : "Download", !have && pc == null);
+                LinearLayout r = row(null, m.name, m.accent + " English" + (have ? " · downloaded ✓" : ""), btn);
+                if (pc == null) btn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+                    if (have) removePiper(m); else downloadPiper(m); } });
+                body.addView(r);
+            }
+        } };
+        refreshPiperDialog.run();
+        new AlertDialog.Builder(this).setTitle("Piper voices").setView(scrollOf(body))
+            .setPositiveButton("Done", null)
+            .setOnDismissListener(new DialogInterface.OnDismissListener() { public void onDismiss(DialogInterface d) { refreshPiperDialog = null; } })
+            .show();
+    }
+
+    private void downloadPiper(final Piper.Model m) {
+        downloads.put(m.id, 0);
+        if (refreshPiperDialog != null) refreshPiperDialog.run();
+        new Thread(new Runnable() { public void run() {
+            String err = null;
+            try {
+                piper.download(m.id, new Piper.Progress() { public void update(final int pc) {
+                    handler.post(new Runnable() { public void run() {
+                        downloads.put(m.id, pc);
+                        if (refreshPiperDialog != null) refreshPiperDialog.run(); } });
+                } });
+            } catch (Exception e) { err = e.getMessage(); }
+            final String error = err;
+            handler.post(new Runnable() { public void run() {
+                downloads.remove(m.id);
+                if (error != null) toast("Couldn't download " + m.name + ": " + error);
+                else {
+                    chosen.add("piper|" + m.id);
+                    saveChosen();
+                    rebuildVoices();
+                    toast(m.name + " is ready and ticked");
+                }
+                if (refreshPiperDialog != null) refreshPiperDialog.run();
+            } });
+        } }).start();
+    }
+
+    private void removePiper(final Piper.Model m) {
+        new AlertDialog.Builder(this).setMessage("Remove the " + m.name + " voice from this phone?")
+            .setPositiveButton("Remove", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+                stop();
+                bg.execute(new Runnable() { public void run() {
+                    piper.delete(m.id);
+                    handler.post(new Runnable() { public void run() {
+                        chosen.remove("piper|" + m.id);
+                        saveChosen();
+                        clearSynth();
+                        rebuildVoices();
+                        if (refreshPiperDialog != null) refreshPiperDialog.run(); } });
+                } });
+            } })
+            .setNegativeButton("Cancel", null).show();
+    }
+
+    private void cloudDialog() {
+        final LinearLayout body = dialogBody("Studio-quality voices from an online service, using your own API key. Needs internet; each new line costs a little (lines are saved after the first time, so repeats are free).");
+        final AlertDialog[] dlg = new AlertDialog[1];
+        for (final String p : Cloud.PROVIDERS) {
+            Eng e = cloudEngs.get(p);
+            String status = e == null ? "Not set up" : e.cloudVoices.size() + " voices";
+            TextView btn = chip(e == null ? "Add key" : "Change", e == null);
+            LinearLayout r = row(null, Cloud.label(p), status, btn);
+            View.OnClickListener l = new View.OnClickListener() { public void onClick(View v) { dlg[0].dismiss(); keyDialog(p); } };
+            btn.setOnClickListener(l);
+            r.setOnClickListener(l);
+            body.addView(r);
+        }
+        dlg[0] = new AlertDialog.Builder(this).setTitle("Cloud voices").setView(scrollOf(body))
+            .setPositiveButton("Done", null).show();
+    }
+
+    private void keyDialog(final String p) {
+        final boolean has = cloudEngs.containsKey(p);
+        LinearLayout body = dialogBody(Cloud.keyHelp(p));
+        final EditText key = new EditText(this);
+        key.setHint("Paste API key");
+        key.setSingleLine(true);
+        key.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        String old = prefs.getString("key_" + p, null);
+        if (old != null) key.setText(old);
+        body.addView(key);
+        AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle(Cloud.label(p)).setView(body)
+            .setPositiveButton("Save", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+                String k = key.getText().toString().trim();
+                if (k.length() > 0) saveKey(p, k); } })
+            .setNegativeButton("Cancel", null);
+        if (has) b.setNeutralButton("Remove", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+            stop();
+            prefs.edit().remove("key_" + p).remove("cv_" + p).apply();
+            cloudEngs.remove(p);
+            clearSynth();
+            rebuildVoices(); } });
+        b.show();
+    }
+
+    private void saveKey(final String p, final String key) {
+        toast("Checking " + Cloud.label(p) + " key…");
+        bg.execute(new Runnable() { public void run() {
+            String err = null;
+            List<Cloud.CVoice> list = null;
+            try { list = Cloud.listVoices(p, key); } catch (Exception e) { err = e.getMessage(); }
+            final String error = err;
+            final List<Cloud.CVoice> vs = list;
+            handler.post(new Runnable() { public void run() {
+                if (error != null) { toast(Cloud.label(p) + ": " + error); return; }
+                JSONArray arr = new JSONArray();
+                try { for (Cloud.CVoice v : vs) arr.put(new JSONObject().put("id", v.id).put("name", v.name)); } catch (Exception ignored) { }
+                prefs.edit().putString("key_" + p, key).putString("cv_" + p, arr.toString()).apply();
+                loadCloudEng(p);
+                rebuildVoices();
+                toast("Added " + vs.size() + " " + Cloud.label(p) + " voices — tick the ones you want");
+            } });
+        } });
+    }
+
+    private void loadCloudEng(String p) {
+        Eng e = new Eng();
+        e.kind = CLOUD; e.pkg = p; e.label = Cloud.label(p); e.ready = true;
+        try {
+            JSONArray arr = new JSONArray(prefs.getString("cv_" + p, "[]"));
+            for (int i = 0; i < arr.length(); i++)
+                e.cloudVoices.add(new Cloud.CVoice(arr.getJSONObject(i).getString("id"), arr.getJSONObject(i).getString("name")));
+        } catch (Exception ignored) { }
+        cloudEngs.put(p, e);
+    }
+
+    private void enginesDialog() {
+        LinearLayout body = dialogBody("Speech engines from the Play Store. Once installed, their English voices appear in your list automatically.");
+        String[][] list = {
+            { "SherpaTTS", "Piper and Coqui neural voices as a phone-wide engine", "sherpa" },
+            { "RHVoice", "Light, clear offline voices", "rhvoice" },
+            { "eSpeak NG", "Very small, robotic — a deliberately different sound", "espeak" },
+        };
+        for (final String[] it : list) {
+            boolean installed = false;
+            for (Eng e : engines) {
+                String s = ((e.label == null ? "" : e.label) + " " + (e.pkg == null ? "" : e.pkg)).toLowerCase(Locale.US);
+                if (s.contains(it[2])) installed = true;
+            }
+            TextView btn = chip(installed ? "Installed ✓" : "Get", !installed);
+            LinearLayout r = row(null, it[0], it[1], btn);
+            if (!installed) btn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { playStore(it[0]); } });
+            body.addView(r);
+        }
+        new AlertDialog.Builder(this).setTitle("Free speech engines").setView(scrollOf(body))
+            .setPositiveButton("Done", null).show();
+    }
+
+    private void playStore(String q) {
+        String enc = Uri.encode(q);
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=" + enc + "&c=apps"))); }
+        catch (Exception e) {
+            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q=" + enc + "&c=apps"))); }
+            catch (Exception e2) { toast("Search the Play Store for " + q); }
+        }
     }
 
     // ---------- File ----------
@@ -495,10 +751,12 @@ public class MainActivity extends Activity {
 
     private int cur() { return order.isEmpty() ? -1 : order.get(Math.min(idx, order.size() - 1)); }
 
-    /** Line index that plays after the given position (wrapping into next round). */
-    private int lineAfter(int pos) {
+    private int nextPos() { return idx + 1 < order.size() ? idx + 1 : 0; }
+
+    /** Line index that plays after the current position (wrapping into the next round). */
+    private int lineAfter() {
         if (order.isEmpty()) return -1;
-        if (pos + 1 < order.size()) return order.get(pos + 1);
+        if (idx + 1 < order.size()) return order.get(idx + 1);
         if (!randomize) return order.get(0);
         if (upcoming == null) upcoming = newOrder(order.get(order.size() - 1));
         return upcoming.get(0);
@@ -511,22 +769,22 @@ public class MainActivity extends Activity {
         int c = cur();
         upcoming = null;
         clearSynth();
+        order = newOrder(-1);
         if (on) {
-            order = newOrder(-1);
             Collections.swap(order, 0, order.indexOf(c));   // keep the current line, shuffle the rest after it
             idx = 0;
         } else {
-            order = newOrder(-1);
             idx = c;
         }
         saveIdx();
         showLine();
     }
 
-    // ---------- Speech engines & voices ----------
+    // ---------- System speech engines ----------
 
     private void addEngine(String pkg, String label) {
         final Eng e = new Eng();
+        e.kind = SYS;
         e.pkg = pkg;
         e.label = label;
         TextToSpeech.OnInitListener l = new TextToSpeech.OnInitListener() {
@@ -540,22 +798,29 @@ public class MainActivity extends Activity {
     private void engineInit(Eng e, int status) {
         boolean first = engines.indexOf(e) == 0;
         if (status != TextToSpeech.SUCCESS) {
-            if (first) notice("Text-to-speech isn't available. Install \"Speech Services by Google\" from the Play Store.");
+            if (first) notice("Phone text-to-speech isn't available. Install \"Speech Services by Google\" from the Play Store, or add Piper or cloud voices below.");
             else { engines.remove(e); try { e.tts.shutdown(); } catch (Exception ignored) { } }
             return;
         }
         e.ready = true;
         ttsReady = true;
         if (first) {
-            try {
-                e.pkg = e.tts.getDefaultEngine();
-                for (TextToSpeech.EngineInfo ei : e.tts.getEngines()) {
-                    if (ei.name.equals(e.pkg)) e.label = ei.label;
-                    else addEngine(ei.name, ei.label);
-                }
-            } catch (Exception ignored) { }
+            try { e.pkg = e.tts.getDefaultEngine(); } catch (Exception ignored) { }
+            scanEngines();
         }
         loadVoices(e, 0);
+    }
+
+    /** Add any installed speech engine we aren't using yet. */
+    private void scanEngines() {
+        if (engines.isEmpty() || !engines.get(0).ready) return;
+        try {
+            for (TextToSpeech.EngineInfo ei : engines.get(0).tts.getEngines()) {
+                boolean have = false;
+                for (Eng e : engines) if (ei.name.equals(e.pkg)) { have = true; if (e.label == null) e.label = ei.label; }
+                if (!have) addEngine(ei.name, ei.label);
+            }
+        } catch (Exception ignored) { }
     }
 
     private void loadVoices(final Eng e, final int attempt) {
@@ -568,8 +833,7 @@ public class MainActivity extends Activity {
         e.voices.clear();
         if (all != null) for (Voice v : all) {
             if (v.getFeatures() != null && v.getFeatures().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)) continue;
-            if (v.getLocale() == null) continue;
-            if (!v.getLocale().getLanguage().equals("en")) continue;   // English voices only
+            if (v.getLocale() == null || !v.getLocale().getLanguage().equals("en")) continue;   // English voices only
             e.voices.add(v);
         }
         if (e.voices.isEmpty() && engines.indexOf(e) == 0) {
@@ -580,39 +844,58 @@ public class MainActivity extends Activity {
         rebuildVoices();
     }
 
+    // ---------- Voice list ----------
+
+    private VItem item(Eng e, Voice v, String id, String name) {
+        VItem it = new VItem();
+        it.e = e; it.v = v; it.id = id; it.name = name;
+        it.key = e.pkg + "|" + (v != null ? v.getName() : id);
+        return it;
+    }
+
     private void rebuildVoices() {
-        final List<VItem> female = new ArrayList<>(), all = new ArrayList<>();
-        for (Eng e : engines) for (Voice v : e.voices) {
-            VItem it = new VItem();
-            it.e = e; it.v = v; it.key = e.pkg + "|" + v.getName();
-            all.add(it);
-            if (isFemale(v)) female.add(it);
-        }
+        voices.clear();
+        List<VItem> sysFemale = new ArrayList<>(), sysAll = new ArrayList<>(), piperItems = new ArrayList<>();
         Comparator<VItem> cmp = new Comparator<VItem>() { public int compare(VItem a, VItem b) {
             int c = Boolean.compare(a.v.isNetworkConnectionRequired(), b.v.isNetworkConnectionRequired());
-            if (c != 0) return c;
-            c = Integer.compare(engines.indexOf(a.e), engines.indexOf(b.e));
             return c != 0 ? c : a.v.getName().compareTo(b.v.getName()); } };
-        Collections.sort(female, cmp);
-        Collections.sort(all, cmp);
+        for (Eng e : engines) {
+            List<VItem> f = new ArrayList<>(), o = new ArrayList<>();
+            for (Voice v : e.voices) {
+                VItem it = item(e, v, null, v.getName());
+                if (isFemale(v)) f.add(it); else o.add(it);
+            }
+            Collections.sort(f, cmp);
+            Collections.sort(o, cmp);
+            sysFemale.addAll(f);
+            sysAll.addAll(f);
+            sysAll.addAll(o);
+            voices.addAll(f);
+            voices.addAll(o);
+        }
+        noFemaleDetected = sysFemale.isEmpty() && !sysAll.isEmpty();
 
-        noFemaleDetected = female.isEmpty();
-        voices.clear();
-        voices.addAll(noFemaleDetected ? all : female);
-        if (!noFemaleDetected) for (VItem v : all) if (!female.contains(v)) voices.add(v);   // others, unticked
+        for (Piper.Model m : Piper.CATALOG) if (piper.installed(m.id)) piperItems.add(item(piperEng, null, m.id, m.name + " · " + m.accent));
+        voices.addAll(piperItems);
+        for (Eng e : cloudEngs.values()) for (Cloud.CVoice cv : e.cloudVoices) voices.add(item(e, null, cv.id, cv.name));
 
         Set<String> saved = prefs.getStringSet("voices", null);
         chosen.clear();
         // older versions saved bare voice names (default engine only)
         if (saved != null) for (VItem v : voices)
-            if (saved.contains(v.key) || (v.e == engines.get(0) && saved.contains(v.v.getName()))) chosen.add(v.key);
-        if (chosen.isEmpty()) for (VItem v : (noFemaleDetected ? all : female)) chosen.add(v.key);
+            if (saved.contains(v.key) || (v.v != null && !engines.isEmpty() && v.e == engines.get(0) && saved.contains(v.v.getName()))) chosen.add(v.key);
+        if (chosen.isEmpty()) {
+            for (VItem v : (sysFemale.isEmpty() ? sysAll : sysFemale)) chosen.add(v.key);
+            for (VItem v : piperItems) chosen.add(v.key);
+        }
 
         renderVoices();
-        notice(noFemaleDetected && !voices.isEmpty()
-            ? "Couldn't tell which voices are female on this phone, so pitch is raised a bit. Untick any male voices below." : null);
+        notice(noFemaleDetected
+            ? "Couldn't tell which phone voices are female, so their pitch is raised a bit. Untick any male voices below." : null);
         showLine();
     }
+
+    private void saveChosen() { prefs.edit().putStringSet("voices", new HashSet<>(chosen)).apply(); }
 
     private static boolean isFemale(Voice v) {
         String n = v.getName().toLowerCase(Locale.US);
@@ -627,46 +910,86 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    private String engineLabel(Eng e) {
+        if (e.label != null) return e.label;
+        return e.pkg != null ? e.pkg : "Phone voice";
+    }
+
     private String subtitle(VItem it) {
-        String code = it.v.getName();
-        int x = code.indexOf("-x-");
-        if (x >= 0 && code.length() >= x + 6) code = code.substring(x + 3, x + 6);
-        String s = code;
-        if (engines.size() > 1 && it.e.label != null) s += " · " + it.e.label;
-        if (it.v.isNetworkConnectionRequired()) s += " · needs internet";
+        String s = engineLabel(it.e) + " · " + it.name;
+        if (it.v != null && it.v.isNetworkConnectionRequired()) s += " · needs internet";
         return s;
     }
 
     private void renderVoices() {
         voiceBox.removeAllViews();
         int n = 1;
-        for (final VItem it : voices) {
+        Eng group = null;
+        boolean folded = false;
+        for (int i = 0; i < voices.size(); i++) {
+            final VItem it = voices.get(i);
+            if (it.e != group) {
+                group = it.e;
+                int total = 0, on = 0;
+                for (VItem v : voices) if (v.e == group) { total++; if (chosen.contains(v.key)) on++; }
+                final String fk = "fold_" + group.pkg;
+                folded = prefs.getBoolean(fk, total > 8);
+                final boolean f = folded;
+                TextView h = text((folded ? "▸  " : "▾  ") + engineLabel(group) + "   ·   " + on + " of " + total + " on", 14, ROSE_DARK, true);
+                h.setPadding(dp(4), dp(14), dp(4), dp(4));
+                h.setClickable(true);
+                h.setBackground(ripple(shape(Color.TRANSPARENT, 8, 0), ROSE_SOFT));
+                h.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+                    prefs.edit().putBoolean(fk, !f).apply(); renderVoices(); } });
+                voiceBox.addView(h);
+            }
+            final int num = n++;
+            if (folded) continue;
             final CheckBox cb = checkBox();
             cb.setChecked(chosen.contains(it.key));
             TextView play = roundBtn("▶", 38, false);
             play.setTextSize(13);
             play.setElevation(0);
-            LinearLayout.LayoutParams plp = (LinearLayout.LayoutParams) play.getLayoutParams();
-            plp.setMargins(dp(4), 0, 0, 0);
+            ((LinearLayout.LayoutParams) play.getLayoutParams()).setMargins(dp(4), 0, 0, 0);
             play.setOnClickListener(new View.OnClickListener() { public void onClick(View view) { preview(it); } });
-            final LinearLayout row = checkRow(cb, "Voice " + (n++), subtitle(it), play);
-            row.setOnClickListener(new View.OnClickListener() { public void onClick(View view) {
-                cb.setChecked(!cb.isChecked());
-                styleRow(row, cb.isChecked());
-                if (cb.isChecked()) chosen.add(it.key); else chosen.remove(it.key);
+            final LinearLayout r = row(cb, "Voice " + num, subtitle(it), play);
+            styleRow(r, cb.isChecked());
+            r.setOnClickListener(new View.OnClickListener() { public void onClick(View view) {
+                if (cb.isChecked()) chosen.remove(it.key); else chosen.add(it.key);
                 clearSynth();
-                prefs.edit().putStringSet("voices", new HashSet<>(chosen)).apply();
+                saveChosen();
+                renderVoices();
                 showLine(); } });
-            row.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View view) { preview(it); return true; } });
-            voiceBox.addView(row);
+            r.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View view) { preview(it); return true; } });
+            voiceBox.addView(r);
+        }
+        if (voices.isEmpty()) {
+            TextView t = text("No voices yet — tap Get more voices.", 14, SUBTEXT, false);
+            t.setPadding(dp(4), dp(10), dp(4), 0);
+            voiceBox.addView(t);
         }
     }
 
-    private void preview(VItem it) {
+    private void preview(final VItem it) {
         stop();
-        it.e.tts.setVoice(it.v);
-        it.e.tts.setPitch(noFemaleDetected ? 1.25f : 1.0f);
-        it.e.tts.speak("Hi, this is how I sound.", TextToSpeech.QUEUE_FLUSH, null, "preview");
+        final String hi = "Hi, this is how I sound.";
+        if (it.e.kind == SYS) {
+            it.e.tts.setVoice(it.v);
+            it.e.tts.setPitch(noFemaleDetected ? 1.25f : 1.0f);
+            it.e.tts.speak(hi, TextToSpeech.QUEUE_FLUSH, null, "preview");
+            return;
+        }
+        if (it.e.kind == CLOUD) toast("Fetching sample…");
+        final File f = new File(castDir, "preview" + (++fileSeq) + (it.e.kind == CLOUD ? ".mp3" : ".wav"));
+        bg.execute(new Runnable() { public void run() {
+            String err = null;
+            try { synthFile(it, hi, f); } catch (Throwable t) { err = String.valueOf(t.getMessage()); }
+            final String error = err;
+            handler.post(new Runnable() { public void run() {
+                if (error != null) { toast("Couldn't play sample: " + error); return; }
+                if (!playing) playLocal(f, -1);
+            } });
+        } });
     }
 
     private List<VItem> activeVoices() {
@@ -682,12 +1005,16 @@ public class MainActivity extends Activity {
     // ---------- Playback ----------
 
     private void play() {
-        if (!ttsReady) { toast("Speech engine still starting…"); return; }
         if (lines.isEmpty()) { toast("Open a file first"); return; }
-        if (activeVoices().isEmpty()) { toast("Tick at least one voice"); return; }
+        List<VItem> a = activeVoices();
+        if (a.isEmpty()) { toast("Tick at least one voice"); return; }
+        boolean needSys = false;
+        for (VItem v : a) if (v.e.kind == SYS) needSys = true;
+        if (needSys && !ttsReady) { toast("Speech engine still starting…"); return; }
         if (cast != null && !cast.isReady()) { toast("Still connecting to " + cast.name + "…"); return; }
         if (idx >= order.size()) idx = 0;
         playing = true;
+        failures = 0;
         playBtn.setText("■");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         speakCurrent();
@@ -697,6 +1024,7 @@ public class MainActivity extends Activity {
         playing = false;
         curUtt = null;
         stopAllEngines(null);
+        releasePlayer();
         synthPending.clear();
         pendingLoad = -1;
         if (cast != null && awaitingIdx >= 0) cast.stopMedia();
@@ -750,7 +1078,7 @@ public class MainActivity extends Activity {
 
     private VItem applyVoice(int pos) {
         VItem v = voiceFor(pos);
-        if (v == null) return null;
+        if (v == null || v.e.kind != SYS) return v;
         v.e.tts.setVoice(v.v);
         v.e.tts.setPitch(noFemaleDetected ? 1.2f + 0.05f * (pos % 3) : 1.0f);
         return v;
@@ -758,17 +1086,172 @@ public class MainActivity extends Activity {
 
     private void speakCurrent() {
         showLine();
-        if (cast != null) { castCurrent(); return; }
-        VItem v = applyVoice(idx);
+        awaitingIdx = -1;
+        releasePlayer();
+        VItem v = voiceFor(idx);
         if (v == null) { stop(); return; }
+        if (cast != null || v.e.kind != SYS) { stopAllEngines(null); fileCurrent(); return; }
         stopAllEngines(v.e);
+        applyVoice(idx);
         curUtt = "L" + (++uttSeq);
         v.e.tts.speak(lines.get(cur()), TextToSpeech.QUEUE_FLUSH, null, curUtt);
+        prefetchNext();
     }
 
     private void utteranceDone(String id, boolean ok) {
-        if (id.startsWith("S")) { synthFinished(id, ok); return; }
-        if (playing && cast == null && id.equals(curUtt)) advance();
+        if (id.startsWith("S")) { synthFinished(id, ok, null); return; }
+        if (playing && id.equals(curUtt)) {
+            if (ok) failures = 0;
+            else if (++failures >= 3) { stop(); toast("The speech engine keeps failing — try other voices"); return; }
+            advance();
+        }
+    }
+
+    // ---------- Audio files ----------
+
+    private void clearSynth() {
+        synthGen++;
+        synthDone.clear();
+        synthPending.clear();
+        synthFiles.clear();
+        pendingLoad = -1;
+    }
+
+    private static String sha1(String s) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-1").digest(s.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte x : d) sb.append(String.format("%02x", x));
+            return sb.toString();
+        } catch (Exception e) { return String.valueOf(s.hashCode()); }
+    }
+
+    private static void copy(File from, File to) throws IOException {
+        InputStream in = new FileInputStream(from);
+        OutputStream out = new FileOutputStream(to);
+        byte[] buf = new byte[65536];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        in.close();
+        out.close();
+    }
+
+    /** Make audio for a Piper or cloud voice. Blocking; runs on the background thread. */
+    private void synthFile(VItem v, String text, File out) throws IOException {
+        if (v.e.kind == PIPER) { piper.synth(v.id, text, out); return; }
+        String key = prefs.getString("key_" + v.e.pkg, null);
+        if (key == null) throw new IOException("No API key");
+        File cached = new File(cloudCache, sha1(v.key + "\n" + text) + ".mp3");
+        if (!cached.isFile()) {   // each line is paid for once, then reused
+            File tmp = new File(cloudCache, cached.getName() + ".part");
+            Cloud.synth(v.e.pkg, key, v.id, text, tmp);
+            if (!tmp.renameTo(cached)) throw new IOException("Couldn't save audio");
+        }
+        copy(cached, out);
+    }
+
+    /** Make an audio file for {@code line}, using the voice for position {@code pos}. */
+    private void ensureSynth(final int line, int pos) {
+        if (line < 0 || line >= lines.size() || synthDone.containsKey(line) || synthPending.contains(line)) return;
+        final VItem v = applyVoice(pos);
+        if (v == null) return;
+        synthPending.add(line);
+        final File f = new File(castDir, "u" + (++fileSeq) + (v.e.kind == CLOUD ? ".mp3" : ".wav"));
+        final String id = "S" + synthGen + "_" + line + "_" + fileSeq;
+        synthFiles.put(id, f);
+        if (v.e.kind == SYS) {
+            v.e.tts.synthesizeToFile(lines.get(line), new Bundle(), f, id);
+            return;
+        }
+        final String text = lines.get(line);
+        bg.execute(new Runnable() { public void run() {
+            String err = null;
+            try { synthFile(v, text, f); } catch (Throwable t) { err = String.valueOf(t.getMessage()); }
+            final String error = err;
+            handler.post(new Runnable() { public void run() { synthFinished(id, error == null, error); } });
+        } });
+    }
+
+    private void synthFinished(String id, boolean ok, String err) {
+        String[] p = id.substring(1).split("_");
+        if (Integer.parseInt(p[0]) != synthGen) return;
+        int i = Integer.parseInt(p[1]);
+        File f = synthFiles.remove(id);
+        if (!synthPending.remove(i)) return;
+        if (!ok || f == null || !f.isFile()) {
+            if (err != null) lastError = err;
+            if (playing && pendingLoad == i) {
+                pendingLoad = -1;
+                if (++failures >= 3) { stop(); toast("Couldn't make speech" + (lastError != null ? ": " + lastError : "")); }
+                else advance();
+            }
+            return;
+        }
+        synthDone.put(i, f);
+        if (playing && pendingLoad == i) { pendingLoad = -1; playFile(i); }
+    }
+
+    private void fileCurrent() {
+        int c = cur();
+        if (synthDone.containsKey(c)) playFile(c);
+        else { pendingLoad = c; ensureSynth(c, idx); }
+    }
+
+    /** Get the next line's audio ready while this one plays (if it needs a file). */
+    private void prefetchNext() {
+        int np = nextPos();
+        VItem nv = voiceFor(np);
+        if (nv != null && (cast != null || nv.e.kind != SYS)) ensureSynth(lineAfter(), np);
+    }
+
+    private void playFile(int line) {
+        File f = synthDone.get(line);
+        awaitingIdx = line;
+        failures = 0;
+        if (cast != null) {
+            String ip = FileServer.localIp();
+            if (ip == null) { stop(); toast("Lost Wi-Fi"); return; }
+            sawPlaying = false;
+            cast.load("http://" + ip + ":" + serverPort + "/" + f.getName(), lines.get(line));
+        } else {
+            playLocal(f, line);
+        }
+        prefetchNext();
+        int n = lineAfter();
+        // drop audio files we no longer need
+        for (Integer k : new ArrayList<>(synthDone.keySet()))
+            if (k != line && k != n) { synthDone.get(k).delete(); synthDone.remove(k); }
+    }
+
+    private void playLocal(File f, final int line) {
+        releasePlayer();
+        final MediaPlayer mp = new MediaPlayer();
+        player = mp;
+        MediaPlayer.OnCompletionListener done = new MediaPlayer.OnCompletionListener() { public void onCompletion(MediaPlayer m) {
+            if (mp != player) return;
+            releasePlayer();
+            if (line >= 0 && playing && awaitingIdx == line && cur() == line) { awaitingIdx = -1; advance(); } } };
+        mp.setOnCompletionListener(done);
+        mp.setOnErrorListener(new MediaPlayer.OnErrorListener() { public boolean onError(MediaPlayer m, int what, int extra) {
+            if (mp == player && line >= 0 && playing && awaitingIdx == line && ++failures >= 3) { stop(); toast("Couldn't play audio"); return true; }
+            if (mp == player && line >= 0 && playing && awaitingIdx == line) { releasePlayer(); awaitingIdx = -1; advance(); }
+            return true; } });
+        try {
+            mp.setDataSource(f.getAbsolutePath());
+            mp.prepare();
+            mp.start();
+        } catch (Exception e) {
+            releasePlayer();
+            if (line >= 0 && playing) { if (++failures >= 3) { stop(); toast("Couldn't play audio"); } else advance(); }
+        }
+    }
+
+    private void releasePlayer() {
+        if (player == null) return;
+        MediaPlayer mp = player;
+        player = null;
+        try { mp.stop(); } catch (Exception ignored) { }
+        try { mp.release(); } catch (Exception ignored) { }
     }
 
     // ---------- Casting ----------
@@ -875,60 +1358,8 @@ public class MainActivity extends Activity {
         cast.connect();
     }
 
-    private void clearSynth() {
-        synthGen++;
-        synthDone.clear();
-        synthPending.clear();
-        pendingLoad = -1;
-    }
-
-    /** Synthesize line {@code line} with the voice for position {@code pos}. */
-    private void ensureSynth(int line, int pos) {
-        if (line < 0 || line >= lines.size() || synthDone.containsKey(line) || synthPending.contains(line)) return;
-        VItem v = applyVoice(pos);
-        if (v == null) return;
-        synthPending.add(line);
-        File f = new File(castDir, "u" + (++fileSeq) + ".wav");
-        v.e.tts.synthesizeToFile(lines.get(line), new Bundle(), f, "S" + synthGen + "_" + line + "_" + fileSeq);
-    }
-
-    private void synthFinished(String id, boolean ok) {
-        String[] p = id.substring(1).split("_");
-        if (Integer.parseInt(p[0]) != synthGen) return;
-        int i = Integer.parseInt(p[1]);
-        if (!synthPending.remove(i)) return;
-        File f = new File(castDir, "u" + p[2] + ".wav");
-        if (!ok || !f.isFile()) {
-            if (playing && pendingLoad == i) { pendingLoad = -1; advance(); }
-            return;
-        }
-        synthDone.put(i, f);
-        if (playing && pendingLoad == i) { pendingLoad = -1; castLoad(i); }
-    }
-
-    private void castCurrent() {
-        awaitingIdx = -1;
-        int c = cur();
-        if (synthDone.containsKey(c)) castLoad(c);
-        else { pendingLoad = c; ensureSynth(c, idx); }
-    }
-
-    private void castLoad(int line) {
-        String ip = FileServer.localIp();
-        if (ip == null || cast == null) { stop(); toast("Lost Wi-Fi"); return; }
-        awaitingIdx = line;
-        sawPlaying = false;
-        cast.load("http://" + ip + ":" + serverPort + "/" + synthDone.get(line).getName(), lines.get(line));
-        int nextPos = idx + 1 < order.size() ? idx + 1 : 0;
-        int n = lineAfter(idx);
-        ensureSynth(n, nextPos);   // get the next line ready while this one plays
-        // drop audio files we no longer need
-        for (Integer k : new ArrayList<>(synthDone.keySet()))
-            if (k != line && k != n) { synthDone.get(k).delete(); synthDone.remove(k); }
-    }
-
     private void mediaStatus(JSONObject s) {
-        if (!playing || awaitingIdx != cur()) return;
+        if (!playing || awaitingIdx < 0 || awaitingIdx != cur()) return;
         String state = s.optString("playerState");
         if ("PLAYING".equals(state) || "BUFFERING".equals(state)) { sawPlaying = true; return; }
         if (!"IDLE".equals(state)) return;
@@ -953,11 +1384,14 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        releasePlayer();
         if (cast != null) cast.shutdown();
         if (server != null) server.stop();
         try { if (discovery != null) nsd.stopServiceDiscovery(discovery); } catch (Exception ignored) { }
         try { if (mcLock != null) mcLock.release(); } catch (Exception ignored) { }
         for (Eng e : engines) try { e.tts.stop(); e.tts.shutdown(); } catch (Exception ignored) { }
+        bg.execute(new Runnable() { public void run() { piper.releaseAll(); } });
+        bg.shutdown();
         super.onDestroy();
     }
 }
